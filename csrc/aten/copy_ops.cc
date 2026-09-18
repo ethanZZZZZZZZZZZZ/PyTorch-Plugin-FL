@@ -27,6 +27,8 @@
 #include "backends/musa/mudnn_common.h"
 #elif defined(USE_MUSA)
 #include "runtime/accelerator/musa/musa_stream.h"
+#elif defined(USE_GCU)
+#include "runtime/accelerator/gcu/tops_stream.h"
 #endif
 
 // On the CUDA-family backends (including MetaX boxing) the flagos device shares
@@ -126,6 +128,22 @@ class BlockingCopyGuard {
     // above is what makes GetDefaultMusaStream() resolve to *this tensor's*
     // device; it keys off the current device, like the mudnn handle.
     musaStreamSynchronize(at::native::flagos::musa::GetDefaultMusaStream());
+#elif defined(USE_GCU)
+    // Same shape as the MUSA arm, and added for the same reason: the tops
+    // stream is shared by both producers -- topsaten submits to
+    // GetCurrentTopsStream() (see EXEC_TOPSATEN_CMD) and FlagGems submits to the
+    // handle triton's enflame driver reads back from
+    // `torch.gcu.current_stream(idx).gcu_stream`, and on an S60 the two were
+    // measured equal, process after process. With no arm here the function
+    // compiles to nothing on GCU, so a blocking copy issued after a FlagGems
+    // kernel could read the buffer before the kernel producing it had run.
+    // Measured with the allocator poisoned and the first host read taken
+    // immediately after the op: 19 of 20 rounds of
+    // `sq.mean(-1, keepdim=True)` came back holding the poison, and 0 of 20 once
+    // this stream was drained first. The result was not merely misreported --
+    // `rsqrt(mean + eps)`, the next step of the RMSNorm it feeds, is a topsaten
+    // op and was wrong in 40 of 40 rounds without the barrier.
+    topsStreamSynchronize(at::native::flagos::gcu::GetCurrentTopsStream());
 #endif
   }
 
@@ -424,6 +442,26 @@ at::Tensor _copy_from(
              ? at::native::flagos::contiguous(self, c10::MemoryFormat::Contiguous)
              : self.contiguous());
 
+  // Every `Memcpy` below moves raw storage bytes and takes its byte count from
+  // the *source*, so a cross-device copy between differing dtypes used to hand
+  // the driver a count that did not match the destination's element width. A
+  // CPU f64 source copied into a device f32 destination wrote twice the
+  // destination's length -- a silent device-heap overflow -- and the f32 -> f64
+  // direction wrote half of the destination and left the rest holding whatever
+  // the allocator last had there. The device<->device pair is unaffected: it
+  // takes the strided-copy path below, which casts.
+  //
+  // Measured on GCU before this conversion, `torch.empty(6, dtype=torch.float64,
+  // device="flagos:6").copy_(torch.arange(6) + 0.5)` returned
+  // `[0.125, 128.0, 4096.0, ...]` -- two fp32 values reinterpreted as one fp64,
+  // max|diff| 4.09e3 -- and `dev_f32.copy_(cpu_f64)` gave max|diff| 4.5e0.
+  // Converting the source on the host first keeps both sides the same width, so
+  // `nbytes` describes the copy exactly; the host `copy_` reached below does the
+  // cast that a raw memcpy cannot.
+  if (self.is_cpu() && self.scalar_type() != dst.scalar_type()) {
+    self_contig = self_contig.to(dst.scalar_type());
+  }
+
   size_t nbytes = self_contig.numel() * self_contig.element_size();
 
   // Every branch below issues a blocking `Memcpy`. The source may have been
@@ -453,7 +491,17 @@ at::Tensor _copy_from(
 #endif
     }
   } else if (self.is_privateuseone() && dst.is_cpu()) {
-    if (dst.is_contiguous()) {
+    if (self.scalar_type() != dst.scalar_type()) {
+      // The device->host direction of the dtype case described above: land the
+      // source's bytes in a CPU tensor of the *source's* dtype, then let the
+      // host copy_ cast into `dst`. Allocating `tmp` with `dst.options()` (as
+      // the branches below do) would make the memcpy disagree with its own
+      // buffer as well.
+      auto tmp =
+          at::empty(self_contig.sizes(), self_contig.options().device(at::kCPU));
+      Memcpy(tmp.data_ptr(), self_contig.data_ptr(), nbytes, MemcpyDeviceToHost);
+      at::native::copy_(const_cast<at::Tensor&>(dst), tmp, false);
+    } else if (dst.is_contiguous()) {
       Memcpy(dst.data_ptr(), self_contig.data_ptr(), nbytes, MemcpyDeviceToHost);
     } else {
       auto tmp = at::empty(self_contig.sizes(), dst.options());
