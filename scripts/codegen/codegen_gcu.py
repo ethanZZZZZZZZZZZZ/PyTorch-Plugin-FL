@@ -331,7 +331,16 @@ METADATA_OPS = {
 # Handwritten kernels live in a separate translation unit when the vendor API
 # does not fit one of the category templates. They still belong in the generated
 # PrivateUse1 coverage include, so list their ATen overloads here.
+#
+# _scaled_dot_product_efficient_attention is here for two reasons the templates
+# cannot express, both documented in docs/vendors/gcu/scaled-dot-product-attention.md:
+# its body returns a 4-tuple rather than one at::Tensor, and it needs a
+# REGISTER_PRIVATEUSE1_DISPATCH registrar into ATen's _fused_sdp_choice
+# DispatchStub (which is what makes the composite pick this leaf at all) rather
+# than an entry in the flagos dispatcher table. The kernel lives in
+# csrc/aten/backends/gcu/scaled_dot_product_attention.cc.
 HANDWRITTEN_OPS = {
+    "_scaled_dot_product_efficient_attention",
     "_sample_dirichlet",
     "_standard_gamma",
     "bernoulli",
@@ -429,9 +438,12 @@ at::Tensor {kernel}(const at::Tensor& self) {{
 REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kGcu, {kernel})
 """
 
-# topsaten does not broadcast for us, so inputs are expanded (and made
-# contiguous, since an expanded view has 0-strides) to the common shape first.
-# Output dtype follows at::result_type, matching PyTorch's promotion.
+# The operands are brought to the common shape as *views*: topsaten broadcasts in
+# its load step (topsaten_ops.h:491), so materialising the expanded operand with
+# `.contiguous()` is a full-size copy per broadcast operand that the card does not
+# need. See gcu::BroadcastTo for the measurement and for the probe that checked
+# every broadcast spelling at the rank-4 attention shapes. Output dtype follows
+# at::result_type, matching PyTorch's promotion.
 #
 # `other` may be a CPU tensor: PyTorch wraps a Python number operand into a
 # 0-dim CPU tensor and dispatches through the Tensor overload (a * 3.0 ->
@@ -441,8 +453,8 @@ _BINARY_PROLOGUE = """\
   auto self_c = self.scalar_type() == result_dtype ? self : self.to(result_dtype);
   auto other_c = other.to(self.device(), result_dtype);
   auto out_shape = at::infer_size(self_c.sizes(), other_c.sizes());
-  auto self_b = self_c.expand(out_shape).contiguous();
-  auto other_b = other_c.expand(out_shape).contiguous();
+  auto self_b = gcu::BroadcastTo(self_c, out_shape);
+  auto other_b = gcu::BroadcastTo(other_c, out_shape);
 """
 
 
@@ -1193,12 +1205,52 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kGcu, {kernel})
 """
 
 # addmm: out = beta * self + alpha * (mat1 @ mat2). `self` (the bias) broadcasts
-# in PyTorch but not in topsaten, so it is expanded to the product's shape.
+# in PyTorch, and in topsaten too. The case that matters is nn.Linear's bias, a
+# contiguous rank-1 (N,) vector, and that goes over as it is: topsatenAddmm
+# broadcasts it in the epilogue, at no measurable cost. Handing it a zero-stride
+# (M, N) expand view instead -- what gcu::BroadcastTo builds for a rank-1 input --
+# was measured on S60 at (4096,3072)x(3072,12288) bf16 to cost 1156 us more than a
+# bare mm, against 118 us on the vendor's own addmm path: the library treats the
+# view as a second full operand and makes another pass over the 101 MB output
+# rather than folding the bias into the epilogue. A dedicated probe ran addmm
+# with the bias materialised, with the zero-stride (M, N) view, and as a bare
+# rank-1 (N,) operand, against a base buffer holding exactly N entries so a
+# stride-blind load would leave it: all three agreed bit for bit in fp32 and
+# bf16. Only the timing argument changed here, not the correctness one.
+#
+# The predicate admits a rank-1 bias of exactly the width the product has. The
+# vendor's own argument check accepts `rhs.dims[1] or 1` ("when bias.rank is 1,
+# bias.dims[0] should be equal to rhs.dims[1] or 1"), so a one-element rank-1
+# bias could take the cheap route too; it stays on the BroadcastTo path, which is
+# unchanged and still correct, because the case that pays for this change is
+# nn.Linear's full-width bias and the narrower predicate is the one the probe
+# pins.
+#
+# `mat2` is deliberately handed over as given, the way the matmul template above
+# already does. The operand that ships is nn.Linear's `weight.t()`: `at::linear`
+# decomposes to `addmm(bias, input, weight.t())`, so `mat2` is a transpose *view*
+# over a contiguous storage. Materialising it copied the whole weight on every
+# call -- at the Qwen-Image shapes (4096,3072)x(3072,3072), one step issued 841
+# `aten::contiguous` calls, 481 of them [3072,3072] and 120 each of [12288,3072],
+# [3072,18432] and [3072,12288] -- for data that never changes. A dedicated probe
+# (`topsatenAddmm` and `topsatenMm` at (4096,3072)x(3072,3072)^T bf16, against the
+# materialised operand and against a double-precision host reference) showed the
+# vendor serves the view bit for bit identically and at no time penalty
+# (0.493 ms materialised vs 0.498 ms as a view); the copy it replaces costs
+# 0.126 ms. `mat1` keeps its `.contiguous()`: an activation can arrive with an
+# arbitrary layout and that case is not what the probe measured.
 _ADDMM_PROLOGUE = """\
   std::vector<int64_t> out_shape{{mat1.size(0), mat2.size(1)}};
-  auto self_b = self.expand(out_shape).contiguous();
+  // nn.Linear's bias goes over as the rank-1 vector it is. topsatenAddmm
+  // broadcasts that itself, in the epilogue; the zero-stride (M, N) view
+  // BroadcastTo builds for it costs ~1.1 ms more at the Qwen-Image mlp shape,
+  // which is an extra pass over the 101 MB output. See the note above T_ADDMM.
+  // Any other bias keeps the old description, a one-element rank-1 bias among
+  // them (the vendor would accept it, but no caller pays for the narrow case).
+  auto self_b = (self.dim() == 1 && self.size(0) == mat2.size(1))
+                    ? self
+                    : gcu::BroadcastTo(self, out_shape);
   auto mat1_c = mat1.contiguous();
-  auto mat2_c = mat2.contiguous();
   auto t_beta = gcu::ToTopsatenScalar(beta, self.scalar_type());
   auto t_alpha = gcu::ToTopsatenScalar(alpha, self.scalar_type());
 """
@@ -1224,7 +1276,7 @@ at::Tensor {kernel}(
 
   gcu::TopsatenTensorWrapper t_self(self_b);
   gcu::TopsatenTensorWrapper t_mat1(mat1_c);
-  gcu::TopsatenTensorWrapper t_mat2(mat2_c);
+  gcu::TopsatenTensorWrapper t_mat2(mat2);
   gcu::TopsatenTensorWrapper t_out(out);
   EXEC_TOPSATEN_CMD(
       {tops}, self, t_out.get(), t_self.get(), t_mat1.get(), t_mat2.get(),
@@ -1272,7 +1324,7 @@ at::Tensor& {kernel}(
 
   gcu::TopsatenTensorWrapper t_self(self_b);
   gcu::TopsatenTensorWrapper t_mat1(mat1_c);
-  gcu::TopsatenTensorWrapper t_mat2(mat2_c);
+  gcu::TopsatenTensorWrapper t_mat2(mat2);
   gcu::TopsatenTensorWrapper t_out(out);
   EXEC_TOPSATEN_CMD(
       {tops}, self, t_out.get(), t_self.get(), t_mat1.get(), t_mat2.get(),
@@ -1287,6 +1339,21 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kGcu, {kernel})
 # cat: topsaten takes a std::vector<topsatenTensor>, so the wrappers are held in
 # a vector to keep each one's sizes/strides alive for the duration of the call.
 # An empty tensor is skipped, matching PyTorch's treatment of it as absent.
+#
+# The inputs are handed over as they are, strides included. topsatenCat reads a
+# strided input directly and correctly -- verified on S60 against a host-side
+# gather for a last-dim split of a contiguous buffer (what the Qwen-Image rope's
+# rotate_half produces), a middle-dim split, offset views, a stride-0 dimension on
+# and off the cat dim, a transpose and two overlapping views. The one description
+# it refuses is a negative stride (BAD_PARAM), so only those are materialised.
+#
+# This is not a speedup, and the numbers say so: materialising every input cost
+# 780 topsatenCopy calls in one Qwen-Image transformer step and fell to 540 here,
+# and the step wall did not move (3.627 s -> 3.645 s). A stream drain waits for
+# whatever the device has queued rather than paying a fixed cost of its own, so
+# removing work in front of one drain only moves where the same device time is
+# observed. It is kept because it stops describing the inputs as something they
+# are not, and because it removes redundant device work and round trips.
 T_CAT = """\
 at::Tensor {kernel}(const at::ITensorListRef& tensors, int64_t dim) {{
   std::vector<at::Tensor> inputs;
@@ -1312,6 +1379,9 @@ at::Tensor {kernel}(const at::ITensorListRef& tensors, int64_t dim) {{
   out_shape[d] = total;
   auto out = at::empty(out_shape, inputs[0].options());
 
+  // Only a negative stride needs a copy: topsatenCat refuses it, and the
+  // stride predicate is what keeps the copy off the path the model actually
+  // takes (see the note above T_CAT in the generator).
   std::vector<at::Tensor> contig;
   contig.reserve(inputs.size());
   std::vector<std::unique_ptr<gcu::TopsatenTensorWrapper>> keep;
@@ -1319,9 +1389,11 @@ at::Tensor {kernel}(const at::ITensorListRef& tensors, int64_t dim) {{
   std::vector<topsatenTensor> tops_in;
   tops_in.reserve(inputs.size());
   for (const auto& t : inputs) {{
-    contig.push_back(t.contiguous());
-    keep.push_back(
-        std::make_unique<gcu::TopsatenTensorWrapper>(contig.back()));
+    const bool negative = std::any_of(t.strides().begin(), t.strides().end(),
+                                      [](int64_t s) {{ return s < 0; }});
+    if (negative) contig.push_back(t.contiguous());
+    keep.push_back(std::make_unique<gcu::TopsatenTensorWrapper>(
+        negative ? contig.back() : t));
     tops_in.push_back(keep.back()->get());
   }}
   gcu::TopsatenTensorWrapper t_out(out);
@@ -2712,14 +2784,15 @@ at::Tensor {kernel}(
   auto cond_c = condition.to(dev, at::kBool);
   auto self_c = self.to(dev, result_dtype);
   auto other_c = other.to(dev, result_dtype);
-  // All three operands are expanded, not just the two values: the vendor does not
-  // broadcast, and ATen broadcasts the condition against the values' common
-  // shape, which is not the same thing when the condition is the wider one.
+  // All three operands are expanded, not just the two values: ATen broadcasts
+  // the condition against the values' common shape, which is not the same thing
+  // when the condition is the wider one. The expansion is a view, not a copy --
+  // the vendor broadcasts in its load step, see gcu::BroadcastTo.
   auto out_shape = at::infer_size(
       at::infer_size(cond_c.sizes(), self_c.sizes()), other_c.sizes());
-  auto cond_b = cond_c.expand(out_shape).contiguous();
-  auto self_b = self_c.expand(out_shape).contiguous();
-  auto other_b = other_c.expand(out_shape).contiguous();
+  auto cond_b = gcu::BroadcastTo(cond_c, out_shape);
+  auto self_b = gcu::BroadcastTo(self_c, out_shape);
+  auto other_b = gcu::BroadcastTo(other_c, out_shape);
   auto out = at::empty(out_shape, self_b.options());
   if (out.numel() == 0) {{
     return out;
@@ -2803,9 +2876,10 @@ at::Tensor& {kernel}(
     out.copy_(host);
     return out;
   }}
-  // All three operands are expanded, not just the two values: the vendor does not
-  // broadcast, and ATen broadcasts the condition against the values' common
-  // shape, which is not the same thing when the condition is the wider one.
+  // All three operands are expanded, not just the two values: ATen broadcasts
+  // the condition against the values' common shape, which is not the same thing
+  // when the condition is the wider one. The expansion is a view, not a copy --
+  // the vendor broadcasts in its load step, see gcu::BroadcastTo.
   auto out_shape = at::infer_size(
       at::infer_size(condition.sizes(), self.sizes()), other.sizes());
   if (!out.sizes().equals(out_shape)) {{
@@ -2814,9 +2888,12 @@ at::Tensor& {kernel}(
   if (out.numel() == 0) {{
     return out;
   }}
-  auto cond_b = condition.to(dev, at::kBool).expand(out_shape).contiguous();
-  auto self_b = self.to(dev, result_dtype).expand(out_shape).contiguous();
-  auto other_b = other.to(dev, result_dtype).expand(out_shape).contiguous();
+  auto cond_c = condition.to(dev, at::kBool);
+  auto self_c = self.to(dev, result_dtype);
+  auto other_c = other.to(dev, result_dtype);
+  auto cond_b = gcu::BroadcastTo(cond_c, out_shape);
+  auto self_b = gcu::BroadcastTo(self_c, out_shape);
+  auto other_b = gcu::BroadcastTo(other_c, out_shape);
 
   gcu::TopsatenTensorWrapper t_cond(cond_b);
   gcu::TopsatenTensorWrapper t_self(self_b);
