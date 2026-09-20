@@ -195,16 +195,33 @@ accelerator rather than on the host. Serving it there is not the same as serving
 it quickly — see "Why the complex multiply costs what it does" below, where the
 same multiply turns out to be 91x the cost of copying its own operands.
 
-`QWEN_IMAGE_REAL_ROPE=1` turns on the workaround: `common.import_torch` registers
-the running device type in diffusers' own `ROPE_PER_DEVICE` table and points
-`_get_device_freqs` at rotation angles, reaching the extension point upstream
-provides for exactly this case. `apply_rotary_emb_qwen_neuron` is numerically the
-same rotation the complex path performs, so this is not a numerical shortcut.
+**On GCU the angle path now ships as the default.** `torch_fl`'s GCU branch calls
+`patch_diffusers_qwenimage_rope` at import, which registers the `flagos` device in
+both halves of the extension point upstream provides for exactly this case:
+`ROPE_PER_DEVICE` at the attention call site, and `_get_device_freqs` (on
+`QwenEmbedRope` and `QwenEmbedLayer3DRope`) for the operand — which has to be
+angles, because that method is cached per device and returns the complex
+exponential for every device but `neuron`. The rotation it registers is
+numerically the same rotation the complex path performs, i.e.
+`apply_rotary_emb_qwen_neuron`'s contraction, asserted bit for bit in
+`tests/unit/test_gcu_qwenimage_rope.py`; what differs is the spelling, which drops
+the stride-0 `repeat_interleave` broadcast that function expands each angle with.
+`FLAGOS_DISABLE_QWENIMAGE_ROPE=1` opts out and leaves the table as `diffusers`
+ships it.
 
-It is off by default, and should be reported both ways when it is on, because it
-changes what the run measures — with it off, the census carries the
-`view_as_complex`/`view_as_real` traffic; with it on, the rotation is real-valued
-on the accelerator and those calls disappear.
+`QWEN_IMAGE_REAL_ROPE=1` is what is left for a device kind the plugin does not
+cover: it makes `common.import_torch` do the same registration for the running
+device type. On GCU it is now redundant with the shipped default — and it is
+still meaningful, because `common.py` deliberately does not overwrite an entry
+that is already set, so the shipped consumer survives it. The switch stays
+documented because the harness runs on more than one backend and because the A/B
+below is stated in its terms.
+
+Report the leg both ways regardless, because the state changes what the run
+measures: on the complex path the census carries the
+`view_as_complex`/`view_as_real` traffic; on the angle path the rotation is
+real-valued on the accelerator and those calls disappear. On GCU the two legs are
+now `FLAGOS_DISABLE_QWENIMAGE_ROPE=1` and the default.
 
 #### The switch is worth a third of the step
 
@@ -240,6 +257,47 @@ path under an angle-path label — an early attempt at exactly that A/B reported
 the angle path 4.6x *slower* and its output checksum did not match the one a
 fresh `QWEN_IMAGE_REAL_ROPE=1` process produced. The table above is two fresh
 processes, each with the registration ordered as `common.import_torch` does it.
+
+#### What the shipped registration adds on top of the switch
+
+The table above is the harness switch alone. The plugin now installs the angle
+operand *and* a cheaper expansion of the same rotation, so three legs are worth
+measuring rather than two — and the third is what a user gets without setting
+anything. One warm forward each, one process each, 1024x1024, transformer on
+`flagos`, 3 timed forwards after 1 warm-up:
+
+| | complex (opts out) | neuron (`QWEN_IMAGE_REAL_ROPE=1`) | shipped (default) |
+| --- | --- | --- | --- |
+| `FLAGOS_DISABLE_QWENIMAGE_ROPE` | `1` | `1` | unset |
+| `ROPE_PER_DEVICE['flagos']` | *absent* — `cuda` fallback | `apply_rotary_emb_qwen_neuron` | `flagos_qwenimage_rotary_emb` |
+| forward | 5.411 s | 3.392 s | **2.455 s** |
+| rope total | 3818.7 ms | 1448.2 ms | **546.8 ms** |
+| — share of the forward | **70.6 %** | 42.7 % | **22.3 %** |
+| `freqs` dtype at the call | `complex64` | `float32` | `float32` |
+
+240 rope calls per forward on all three legs, each timed with its own drain. The
+shipped leg is **2.956 s per forward (54.6 %) faster than the fallback it
+removes** and **0.937 s (27.6 %) faster than the angle path it replaces**; the
+harness switch alone accounts for 2.019 s of the first number and the expansion
+for the rest. The three forwards were saved and compared as full model outputs,
+`(1, 4096, 64)` bf16:
+
+| pair | `torch.equal` | max abs delta | elements differing |
+| --- | --- | --- | --- |
+| neuron vs shipped | **True** | `0.000e+00` | **0 / 262144** |
+| complex vs shipped | False | `3.125e-02` | 142636 / 262144 |
+| complex vs neuron | False | `3.125e-02` | 142636 / 262144 |
+
+So the shipped consumer is exactly the neuron rotation end to end, and both real
+legs sit two bf16 ulps from the complex path at the output's own magnitude
+(`2^-6` at `absmax 5.3125`) — the accumulated effect of a complex multiply that
+forms the two products of a pair in a different order. The three leg-identifying
+rows are the table entry, its `__name__`, and the `freqs` dtype; the probe prints
+all three before it loads the pipeline, so a leg labelled wrongly is visible
+before any timing is taken.
+
+Probe: `/tmp/probe_rope_shipped.py`, driver `/tmp/probe_rope_shipped.sh`,
+`TOPS_VISIBLE_DEVICES=0,1,2`, saved outputs `/tmp/rope_out_{complex,neuron,shipped}.pt`.
 
 #### What the switch costs in image quality, and what it is worth end to end
 
@@ -278,6 +336,11 @@ one environment variable apart, back to back on the same cards:
 | output | `/tmp/full_rope0.png` | `/tmp/full_rope1.png` |
 | the two outputs against each other | `MAE 3.637/255`, `PSNR 28.58 dB`, 69.61 % of bytes differing | |
 | the vendor baseline's `4.01 s/it` | 3.37x | **2.09x** |
+
+The `1` column is the harness switch, not what ships. Neither `QWEN_IMAGE_REAL_ROPE`
+is set by default and the plugin's own registration is faster than that switch, so
+the shipped leg reads **`5.01 s/it` against the vendor's `3.81` — `1.31x`**; see
+§5.3, which supersedes the `2.09x` on this row.
 
 That is 38 % off the whole run, the same order as the 36 % the wrapped forward
 measured, so the wrapper was not manufacturing it. The two images are not
@@ -357,16 +420,26 @@ this build is the ratio priced below — 36 % of the forward — and not a fallb
 A vendor run takes the same switch, because the registration is keyed on
 `--device` rather than on the flagos backend: `torch_gcu` renames PrivateUse1 to
 `gcu`, so a vendor run registers `gcu` and the rotation becomes real-valued
-there too. `test_rope_hook.py` covers both interpreters — it checks the
-registration on either one, and where the interpreter can construct the device
-(the vendor build can; a CPU-only torch refuses `gcu` at the device-string parse)
-it also checks that the wrapped method returns `torch.angle` of the frequencies
-placed on that device.
+there too. `test_rope_hook.py` covers both interpreters, and which one it is
+looking at is decided by `QWEN_IMAGE_ROPE_TEST_DEVICE`: on a `flagos` run the
+plugin has already wrapped the operand producer and set the table entry by the
+time the script starts, so what is checked there is that the module switch and
+this file's installer leave that pair alone, while every other device kind
+checks the registration this file makes. Where the interpreter can construct the
+device (the vendor build can; a CPU-only torch refuses `gcu` at the device-string
+parse) it also checks that the wrapped method returns `torch.angle` of the
+frequencies placed on that device. Each run prints which installer it found, so
+an arm that skipped a check cannot read as one that passed.
 
 ```bash
 QWEN_IMAGE_REAL_ROPE=1 tests/manual/qwen_image_2512/run.sh infer --stage transformer-step
 QWEN_IMAGE_REAL_ROPE=1 tests/manual/qwen_image_2512/run.sh infer --stage transformer-step --device gcu
 ```
+
+On GCU a `--device flagos` run no longer needs the variable: `import torch_fl`
+installs the same rotation, minus the `repeat_interleave` expansion, and
+`FLAGOS_DISABLE_QWENIMAGE_ROPE=1` is the opt-out. The variable is still what a
+`--device gcu` run takes, and still what the A/B in §3.3 is stated in.
 
 ## 4. Vendor against flagos, side by side
 
@@ -453,6 +526,12 @@ no complex kernel) and every leg had encoder and VAE on the third visible card
 with transformer blocks 0..29 and 30..59 on the first two, `TOPS_VISIBLE_DEVICES=
 0,1,2`.
 
+The `after` row is the state at `486db58` and the `8.48`/`2.23x` on it are no
+longer what a user gets: it is the harness switch, and §3.3's registration is
+faster than that switch. **For the shipped configuration read §5.3's `5.01 s/it`
+and `1.31x` instead** — this table is kept because the two legs below it are a
+build pair and the shape of that measurement is the point.
+
 **19.33 -> 8.48 is 2.28x, and 56.1 % off the denoising loop**; against the repeat,
 2.19x and 54.4 %. The repeat is the same build run a second time and it produced a
 byte-identical image (`md5 d47974b1…`), which is the evidence that the leg is
@@ -505,6 +584,50 @@ route the vendor's own `addmm` takes instead of a zero-stride `(M, N)` view that
 costs a second pass over the output. The per-op probe sees the same thing from the
 other side: the fused call drops from 2643.2 us to 1575.5 us of device time at
 (4096,3072)x(3072,12288) bf16, which is exactly what a bare `mm` costs there.
+
+### 5.3 The rotation registration, measured on the shipped leg
+
+§3.3 times the rope registration on a single warm forward, because that is the
+only way to see the operand and the expansion separately. What the harness ships
+is the 50-step loop, where a step is two forwards under true CFG, so the same
+change should be worth about twice as much per step. Three legs, one session,
+back to back on the same cards with a warm page cache, one environment variable
+apart, 8 steps at 1024x1024, seed 0:
+
+| Leg | Configuration | `s/it` at 8 steps | stage wall | vs the vendor |
+| --- | --- | --- | --- | --- |
+| opt out | `FLAGOS_DISABLE_QWENIMAGE_ROPE=1` | **11.81** | 267.0 s | 3.10x |
+| shipped | registration installed at import, nothing set | **5.01** | 212.4 s | **1.31x** |
+| reference | `torch_gcu` + diffusers | **3.81** | 197.0 s | 1.00x |
+
+The registration is worth **6.80 s per step, 57.6 % of the loop**, or 3.40 s per
+forward. §3.3 measured 2.956 s for the same change with each rope call timed
+against its own drain, so the step-level gain is larger than twice the isolated
+one. That is the direction §5.2's `cat` row already reports: per-copy cost does
+not project linearly onto a step, because a drain waits for whatever the device
+has queued rather than paying a fixed cost per operation. `5.01` reproduced as
+`5.00` on a separate run in the same session, so the reading is stable to 0.2 %.
+
+**This supersedes the `8.38 s/it` / `2.09x` headline in §3.3 and the `8.48 s/it` /
+`2.23x` "after" row in §5.1 for the configuration a user actually gets.** Both of
+those legs were the harness switch — `QWEN_IMAGE_REAL_ROPE=1`, which selects
+diffusers' `apply_rotary_emb_qwen_neuron` — and the shipped registration is
+faster than that switch by the 0.937 s per forward §3.3 records.
+
+A companion run tried to split the step further, by timing `text-encoder` and
+`vae` on their own so that `wall(vae) - wall(text-encoder)` would isolate the
+1024x1024 decode. That subtraction carries no signal and the arm is best not
+repeated: both stages pay the same ~155-165 s pipeline load (164.1 s and 161.2 s
+on `flagos`, 156.3 s and 153.7 s on the vendor), which is larger than the decode
+and moves more between repeats than the decode is worth. The `s/it` line of the
+`full` stage is the only timing these two arms can contribute.
+
+Logs: `/tmp/rope_ab_{rope_on,rope_off,vendor}.log`, driver `/tmp/run_rope_ab.sh`; the two
+discarded arms are `/tmp/decomp_{flagos,vendor}.log`, driver
+`/tmp/run_stage_decomp.sh`. `TOPS_VISIBLE_DEVICES=0,1,2` on the vendor leg, and
+the vendor leg runs through its own interpreter as §4 describes. No leg sets
+`QWEN_IMAGE_REAL_ROPE`: the opt-out leg uses the switch the change itself ships,
+so both `flagos` legs run diffusers' table unless the plugin replaces it.
 
 ## 6. Readings to record
 
